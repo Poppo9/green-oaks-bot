@@ -12,11 +12,11 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-bot = commands.Bot(command_prefix='ù', intents=intents)
+bot = commands.Bot(command_prefix='!', intents=intents)
 
 @bot.event
 async def on_ready():
-    print(f"Siamo pronti con {bot.user.name}")
+    print(f"SUCCESS: {bot.user.name} avviato correttamente!")
 
 @bot.event
 async def on_message(message):
@@ -28,5 +28,15 @@ async def on_message(message):
     
     await bot.process_commands(message)
 
+@bot.command()
+async def hello(ctx):
 
-bot.run(token, log_handler=handler, log_level=logging.WARNING)
+    await ctx.send(f"ciao {ctx.author.mention}")
+    
+
+@bot.command
+async def e(ctx):
+    await ctx.send("Hai estratto una carta!")
+
+
+bot.run(token, log_handler=handler, log_level=logging.INFO)
