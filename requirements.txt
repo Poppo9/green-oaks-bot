@@ -1,2 +1,6 @@
 discord.py
+discord.py[voice]
 python-dotenv
+yt-dlp
+PyNaCl
+browser-cookie3
