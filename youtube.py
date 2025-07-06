@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Bot musicale Discord – versione estesa ma fedele al comportamento originale.
+Bot musicale Discord.
 """
 
 import os
 import shutil
 import tempfile
+import time
 import logging
 from collections import deque
 from typing import Dict, List, Deque, Optional
@@ -84,17 +85,31 @@ def add_song(guild_id: int, video: dict):
 # ---------------------------------------------------------------------------#
 async def _play_song(ctx: commands.Context, video: dict):
     """Scarica il brano, riproduce e imposta callback per il successivo."""
-    url = video.get("url") or f"https://www.youtube.com/watch?v={video.get('id')}"
+    url = video.get("webpage_url") or f"https://www.youtube.com/watch?v={video.get('id')}"
     title = video.get("title", "Sconosciuto")
 
     # Download in directory temporanea dedicata
     temp_dir = tempfile.mkdtemp(prefix="yt_", dir=TEMP_PARENT)
-    outtmpl = os.path.join(temp_dir, "%(id)s.%(ext)s")
-    ydl_opts = build_ydl_opts({"outtmpl": outtmpl})
+
+    # CORREZIONE: Usa un nome file semplice e corto
+    # Genera un nome file sicuro basato sull'ID del video o un timestamp
+    video_id = video.get('id', str(int(time.time())))
+    # Pulisci l'ID da caratteri problematici
+    safe_id = ''.join(c for c in video_id if c.isalnum() or c in '-_')[:20]
+    outtmpl = os.path.join(temp_dir, f"{safe_id}.%(ext)s")
+    
+    ydl_opts = build_ydl_opts({
+        "outtmpl": outtmpl,
+        # Aggiungi opzioni per evitare nomi file lunghi
+        "restrictfilenames": True,
+        "windowsfilenames": True,
+    })
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            audio_path = ydl.prepare_filename(info)
+            # Usa il nostro template personalizzato
+            audio_path = outtmpl.replace("%(ext)s", info.get('ext', 'webm'))
     except Exception as e:
         shutil.rmtree(temp_dir, ignore_errors=True)
         await ctx.send(f"❌ Errore download: {e}")
@@ -112,9 +127,9 @@ async def _play_song(ctx: commands.Context, video: dict):
     def _after_play(err):
         if err:
             print(f"[Player error] {err}")
-        # Pulizia file temp
+        # Pulisci la cartella temporanea
         shutil.rmtree(temp_dir, ignore_errors=True)
-        # Passa al prossimo brano
+        # Ricomincia con la traccia successiva
         bot.loop.create_task(_play_next(ctx))
 
     vc.play(source, after=_after_play)
@@ -143,22 +158,11 @@ async def on_ready():
     print(f"✅ {bot.user} operativo.")
 
 
-@bot.event
-async def on_message(message: discord.Message):
-    if message.author == bot.user:
-        return
-    if "popo" in message.content.lower():
-        await message.delete()
-        await message.channel.send(f"{message.author.mention} ha detto popo.")
-    await bot.process_commands(message)
-
-
 # ---------------------------------------------------------------------------#
 #                              COMANDI DI RICERCA                            #
 # ---------------------------------------------------------------------------#
-@bot.command(name="yt")
+@bot.command(name="search", aliases=["s"], help="Cerca i primi 10 video su YouTube.")
 async def yt_search(ctx: commands.Context, *, query: str):
-    """Cerca i primi 10 video su YouTube."""
     async with ctx.typing():
         ydl_opts = build_ydl_opts(
             {
@@ -186,13 +190,13 @@ async def yt_search(ctx: commands.Context, *, query: str):
         for idx, v in enumerate(entries, 1)
     )
     await ctx.send(
-        f"**Risultati per:** `{query}`\n"
-        f"```\n{elenco}\n```\n"
-        "Usa `!play <numero>` per aggiungere alla coda."
+        f"**Risultati per:** '{query}'\n"
+        f"'''\n{elenco}\n'''\n"
+        "Usa '!play <numero>' per aggiungere alla coda."
     )
 
 
-@bot.command(name="ytpl")
+#@bot.command(name="search_playlist", aliases=["sytpl"], help="Cerca le prime 10 playlist su YouTube.")
 async def yt_playlist_search(ctx: commands.Context, *, query: str):
     """Cerca playlist YouTube (10 risultati)."""
     async with ctx.typing():
@@ -221,96 +225,166 @@ async def yt_playlist_search(ctx: commands.Context, *, query: str):
     msg = "\n".join(f"{i}. {p.get('title','Sconosciuta')[:80]}" for i, p in enumerate(entries, 1))
     await ctx.send(
         f"**Playlist trovate:**\n"
-        f"```\n{msg}\n```\n"
-        "Usa `!playlist <numero>` per aggiungerla."
+        f"'''\n{msg}\n'''\n"
+        "Usa '!playlist <numero>' per aggiungerla."
     )
 
 
 # ---------------------------------------------------------------------------#
 #                      COMANDI DI RIPRODUZIONE / CODA                         #
 # ---------------------------------------------------------------------------#
-@bot.command(name="play")
+@bot.command(name="play", aliases=["!"], help="Aggiunge video n dalla ricerca, URL o ricerca automatica.")
 async def play(ctx: commands.Context, *, arg: str):
-    """
-    - `!play <numero>` da ultima ricerca video
-    - `!play <url>`  video o playlist
-    """
     vc = await ensure_voice(ctx)
     if vc is None:
         return
 
-    # Caso indice
+    # 1) Se è un indice
     if arg.isdigit():
         index = int(arg) - 1
         entries = search_cache.get(ctx.guild.id)
-        if not entries or not (0 <= index < len(entries)):
-            await ctx.send("⚠️ Indice invalido o nessuna ricerca.")
-            return
-        video = entries[index]
-        add_song(ctx.guild.id, video)
-        await ctx.send(f"🎵 Aggiunto in coda: **{video.get('title','Sconosciuto')}**")
-
-    # Caso URL
-    else:
+        if entries and 0 <= index < len(entries):
+            video = entries[index]
+            add_song(ctx.guild.id, video)
+            await ctx.send(f"🎵 Aggiunto in coda: **{video.get('title','Sconosciuto')}**")
+        else:
+            await ctx.send("⚠️ Indice invalido o nessuna ricerca precedente.")
+    # 2) Se è un URL
+    elif arg.startswith("http://") or arg.startswith("https://"):
         try:
             info = yt_dlp.YoutubeDL(build_ydl_opts()).extract_info(arg, download=False)
         except Exception as e:
             await ctx.send(f"❌ Errore URL: {e}")
             return
 
-        # Playlist
         if info.get("_type") == "playlist" or "entries" in info:
             videos = info["entries"]
             for v in videos:
                 add_song(ctx.guild.id, v)
-            await ctx.send(f"📥 Playlist aggiunta: **{info.get('title','Sconosciuta')}** "
-                           f"({len(videos)} tracce).")
+            await ctx.send(f"📥 Playlist aggiunta: **{info.get('title','Sconosciuta')}** ({len(videos)} tracce).")
         else:
             add_song(ctx.guild.id, info)
             await ctx.send(f"🎵 Aggiunto in coda: **{info.get('title','Sconosciuto')}**")
+    # 3) Fallback: cerca e prendi il primo risultato
+    else:
+        async with ctx.typing():
+            ydl_opts = build_ydl_opts({
+                "skip_download": True,
+                "extract_flat": "in_playlist",
+                "default_search": "ytsearch1",
+                "forcejson": True,
+            })
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    result = ydl.extract_info(arg, download=False)
+                    entries = result.get("entries", [])
+            except Exception as e:
+                await ctx.send(f"❌ Errore ricerca automatica: {e}")
+                return
 
-    # Se non sta già riproducendo, avvia
+        if not entries:
+            await ctx.send("⚠️ Nessun risultato dalla ricerca automatica.")
+            return
+
+        video = entries[0]
+        add_song(ctx.guild.id, video)
+        await ctx.send(
+            f"🔎 Non era indice né URL, ho cercato '**{arg}**' e aggiunto automaticamente: **{video.get('title','Sconosciuto')}**\n"
+            "Per scegliere un video specifico usa `!search` e poi `!play <numero>`."
+        )
+
+    # Avvia riproduzione se fermo
     if not vc.is_playing() and not vc.is_paused():
         await _play_next(ctx)
 
 
-@bot.command(name="playlist")
-async def playlist_add(ctx: commands.Context, index: int):
-    """Aggiunge la playlist n dalla ricerca `!ytpl`."""
-    entries = plist_cache.get(ctx.guild.id)
-    if not entries or not (1 <= index <= len(entries)):
-        await ctx.send("⚠️ Indice invalido o nessuna ricerca playlist.")
-        return
 
-    pl_info = entries[index - 1]
-    try:
-        full = yt_dlp.YoutubeDL(build_ydl_opts()).extract_info(pl_info["url"], download=False)
-        videos = full["entries"]
-    except Exception as e:
-        await ctx.send(f"❌ Errore caricamento playlist: {e}")
-        return
+#@bot.command(name="playlist", aliases=["ytpl"], help="Aggiunge playlist n dalla ricerca, URL o ricerca automatica.")
+async def playlist_add(ctx: commands.Context, *, arg: str):
+    # 1) Se è un indice
+    if arg.isdigit():
+        idx = int(arg) - 1
+        entries = plist_cache.get(ctx.guild.id)
+        if entries and 0 <= idx < len(entries):
+            pl_info = entries[idx]
+            try:
+                full = yt_dlp.YoutubeDL(build_ydl_opts()).extract_info(pl_info["url"], download=False)
+            except Exception as e:
+                await ctx.send(f"❌ Errore caricamento playlist: {e}")
+                return
+            videos = full.get("entries", [])
+            for v in videos:
+                add_song(ctx.guild.id, v)
+            await ctx.send(f"📥 Playlist aggiunta: **{full.get('title','Sconosciuta')}** ({len(videos)} tracce).")
+        else:
+            await ctx.send("⚠️ Indice invalido o nessuna ricerca playlist precedente.")
+    # 2) Se è un URL
+    elif arg.startswith("http://") or arg.startswith("https://"):
+        try:
+            info = yt_dlp.YoutubeDL(build_ydl_opts()).extract_info(arg, download=False)
+        except Exception as e:
+            await ctx.send(f"❌ Errore URL: {e}")
+            return
 
-    for v in videos:
-        add_song(ctx.guild.id, v)
-    await ctx.send(f"📥 Playlist **{full.get('title','Sconosciuta')}** aggiunta ({len(videos)} tracce).")
+        if info.get("_type") == "playlist" or "entries" in info:
+            videos = info["entries"]
+            for v in videos:
+                add_song(ctx.guild.id, v)
+            await ctx.send(f"📥 Playlist aggiunta: **{info.get('title','Sconosciuta')}** ({len(videos)} tracce).")
+        else:
+            await ctx.send("⚠️ L'URL non è una playlist valida.")
+    # 3) Fallback: cerca playlist e prendi la prima
+    else:
+        async with ctx.typing():
+            ydl_opts = build_ydl_opts({
+                "skip_download": True,
+                "extract_flat": True,
+                "default_search": "ytsearch1",
+                "forcejson": True,
+            })
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    result = ydl.extract_info(f"{arg} playlist", download=False)
+                    candidates = [e for e in result.get("entries", []) if e.get("_type") == "playlist"]
+            except Exception as e:
+                await ctx.send(f"❌ Errore ricerca playlist automatica: {e}")
+                return
 
+        if not candidates:
+            await ctx.send("⚠️ Nessuna playlist trovata dalla ricerca automatica.")
+            return
+
+        pl = candidates[0]
+        try:
+            full = yt_dlp.YoutubeDL(build_ydl_opts()).extract_info(pl["url"], download=False)
+        except Exception as e:
+            await ctx.send(f"❌ Errore caricamento playlist trovata: {e}")
+            return
+
+        videos = full.get("entries", [])
+        for v in videos:
+            add_song(ctx.guild.id, v)
+        await ctx.send(
+            f"🔎 Non era indice né URL, ho cercato '**{arg}** playlist' e aggiunto automaticamente: **{full.get('title','Sconosciuta')}** "
+            f"({len(videos)} tracce).\nPer scegliere una playlist specifica usa `!search_playlist` e poi `!playlist <numero>`."
+        )
+
+    # Se non sta già riproducendo, avvia
     vc = await ensure_voice(ctx)
     if vc and not vc.is_playing() and not vc.is_paused():
         await _play_next(ctx)
 
 
-@bot.command(name="next", aliases=["skip"])
+@bot.command(name="next", aliases=["skip"], help="Salta al prossimo brano.")
 async def next_track(ctx: commands.Context):
-    """Salta al prossimo brano."""
     if ctx.voice_client is None or not ctx.voice_client.is_playing():
         await ctx.send("⏭️ Nulla in riproduzione.")
         return
-    ctx.voice_client.stop()  # Trigga _after_play
+    ctx.voice_client.stop()  # Triggera _after_play
 
 
-@bot.command(name="prev")
+@bot.command(name="previous", aliases=["prev"], help="Torna al brano precedente.")
 async def previous_track(ctx: commands.Context):
-    """Torna al brano precedente."""
     history = history_map.get(ctx.guild.id, [])
     if len(history) < 2:
         await ctx.send("⏮️ Nessun brano precedente.")
@@ -323,26 +397,25 @@ async def previous_track(ctx: commands.Context):
     ctx.voice_client.stop()
 
 
-@bot.command(name="queue")
+@bot.command(name="queue", aliases=["q"], help="Mostra la coda corrente.")
 async def show_queue(ctx: commands.Context):
-    """Mostra la coda corrente."""
     queue = list(queue_map.get(ctx.guild.id, deque()))
     if not queue:
         await ctx.send("📭 Coda vuota.")
         return
 
     msg = "\n".join(f"{i+1}. {s.get('title','Sconosciuto')[:80]}" for i, s in enumerate(queue))
-    await ctx.send(f"🎶 **Coda:**\n```\n{msg}\n```")
+    await ctx.send(f"🎶 **Coda:**\n'''\n{msg}\n'''")
 
 
-@bot.command(name="clear")
+@bot.command(name="clear", aliases=["c"], help="Pulisci la coda.")
 async def clear_queue(ctx: commands.Context):
     """Svuota la coda."""
     queue_map[ctx.guild.id] = deque()
     await ctx.send("🗑️ Coda cancellata.")
 
 
-@bot.command(name="pause")
+@bot.command(name="pause", aliases=["p"], help="Metti in pausa la riproduzione (!resume per riprendere).")
 async def pause(ctx: commands.Context):
     if ctx.voice_client and ctx.voice_client.is_playing():
         ctx.voice_client.pause()
@@ -351,7 +424,7 @@ async def pause(ctx: commands.Context):
         await ctx.send("⚠️ Nulla in riproduzione.")
 
 
-@bot.command(name="resume")
+@bot.command(name="resume", aliases=["r"], help="Riprendi la riproduzione.")
 async def resume(ctx: commands.Context):
     if ctx.voice_client and ctx.voice_client.is_paused():
         ctx.voice_client.resume()
@@ -360,7 +433,7 @@ async def resume(ctx: commands.Context):
         await ctx.send("⚠️ Nessuna canzone in pausa.")
 
 
-@bot.command(name="leave", aliases=["stop"])
+@bot.command(name="leave", aliases=["stop"], help="Ferma la riproduzione e disconnetti il bot.")
 async def leave(ctx: commands.Context):
     if ctx.voice_client:
         await ctx.voice_client.disconnect()
@@ -368,23 +441,6 @@ async def leave(ctx: commands.Context):
     else:
         await ctx.send("🔇 Il bot non è connesso.")
 
-
-# Comando informativo (non sovrascrive !help di discord.py)
-@bot.command(name="comandi")
-async def custom_help(ctx: commands.Context):
-    await ctx.send(
-        """📘 **Comandi musica:**\n
-`!yt <query>`          – cerca video\n
-`!ytpl <query>`        – cerca playlist\n
-`!play <n/URL>`        – aggiungi video/playlist\n
-`!playlist <n>`        – aggiungi playlist da ultima ricerca\n
-`!queue`               – mostra coda\n
-`!next / !skip`        – canzone successiva\n
-`!prev`                – canzone precedente\n
-`!pause` / `!resume`   – pausa/riprendi\n
-`!clear`               – svuota coda\n
-`!leave`               – esci dal canale\n"""
-    )
 
 # ---------------------------------------------------------------------------#
 #                                   MAIN                                     #
