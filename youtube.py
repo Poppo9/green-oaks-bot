@@ -15,6 +15,7 @@ import discord
 from discord.ext import commands
 import yt_dlp
 from dotenv import load_dotenv
+from discord.ext import tasks
 
 # ---------------------------------------------------------------------------#
 #                      CONFIGURAZIONE E OGGETTI GLOBALI                       #
@@ -31,7 +32,7 @@ intents.message_content = True
 intents.voice_states = True
 intents.members = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="?", intents=intents)
 
 # Risultati ricerca video  |  Risultati ricerca playlist
 search_cache: Dict[int, List[dict]] = {}
@@ -42,6 +43,45 @@ queue_map: Dict[int, Deque[dict]] = {}
 history_map: Dict[int, List[dict]] = {}
 
 TEMP_PARENT = "/tmp"  # Personalizza se vuoi
+
+# ---------------------------------------------------------------------------#
+#                 TASK DI MONITORAGGIO VOICE - AUTO-DISCONNECT               #
+# ---------------------------------------------------------------------------#
+@tasks.loop(seconds=2.5)   # controlla quattro volte in 10 s
+async def voice_guard():
+    now = time.time()
+    for guild in bot.guilds:
+        vc: discord.VoiceClient = guild.voice_client
+        if not vc or not vc.is_connected():
+            continue
+
+        # -- 1) Bot da solo nel canale --------------------------------------
+        others = [m for m in vc.channel.members if not m.bot]
+        if not others:
+            # memorizza l’istante in cui è rimasto solo
+            alone_since = getattr(vc, "_alone_since", None) or now
+            if now - alone_since >= 10:
+                await vc.disconnect()
+                print(f"[voice_guard] Disconnesso (solo bot) in {guild.name}")
+                continue  # salta controllo idle, la connessione non esiste più
+            vc._alone_since = alone_since
+        else:
+            # qualcuno c’è: azzera il timer
+            if hasattr(vc, "_alone_since"):
+                del vc._alone_since
+
+        # -- 2) Idle (né playing né paused) ---------------------------------
+        if not vc.is_playing() and not vc.is_paused():
+            idle_since = getattr(vc, "_idle_since", None) or now
+            if now - idle_since >= 10:
+                await vc.disconnect()
+                print(f"[voice_guard] Disconnesso (idle) in {guild.name}")
+                continue
+            vc._idle_since = idle_since
+        else:
+            if hasattr(vc, "_idle_since"):
+                del vc._idle_since
+
 
 # ---------------------------------------------------------------------------#
 #                               FUNZIONI UTILI                               #
@@ -142,12 +182,21 @@ async def _play_song(ctx: commands.Context, video: dict):
 async def _play_next(ctx: commands.Context):
     """Riproduce il prossimo brano in coda oppure esce dal canale."""
     queue = queue_map.get(ctx.guild.id)
+    vc = ctx.voice_client
+
     if not queue:
-        await ctx.send("✅ Fine coda – disconnessione.")
-        await ctx.voice_client.disconnect()
+        if vc and vc.is_connected():
+            await ctx.send("✅ Fine coda – disconnessione.")
+            await vc.disconnect()
         return
+
+    if vc is None or not vc.is_connected():
+        await ctx.send("⚠️ Non sono connesso a un canale vocale.")
+        return
+
     next_video = queue.popleft()
     await _play_song(ctx, next_video)
+
 
 
 # ---------------------------------------------------------------------------#
@@ -155,7 +204,10 @@ async def _play_next(ctx: commands.Context):
 # ---------------------------------------------------------------------------#
 @bot.event
 async def on_ready():
+    if not voice_guard.is_running():
+        voice_guard.start()
     print(f"✅ {bot.user} operativo.")
+
 
 
 # ---------------------------------------------------------------------------#
@@ -193,40 +245,6 @@ async def yt_search(ctx: commands.Context, *, query: str):
         f"**Risultati per:** '{query}'\n"
         f"'''\n{elenco}\n'''\n"
         "Usa '!play <numero>' per aggiungere alla coda."
-    )
-
-
-#@bot.command(name="search_playlist", aliases=["sytpl"], help="Cerca le prime 10 playlist su YouTube.")
-async def yt_playlist_search(ctx: commands.Context, *, query: str):
-    """Cerca playlist YouTube (10 risultati)."""
-    async with ctx.typing():
-        ydl_opts = build_ydl_opts(
-            {
-                "skip_download": True,
-                "extract_flat": True,
-                "default_search": "ytsearch10",
-                "forcejson": True,
-            }
-        )
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                result = ydl.extract_info(f"{query} playlist", download=False)
-                # Filtra solo risultati playlist
-                entries = [e for e in result.get("entries", []) if e.get("_type") == "playlist"]
-        except Exception as e:
-            await ctx.send(f"Errore ricerca playlist: {e}")
-            return
-
-    if not entries:
-        await ctx.send("⚠️ Nessuna playlist trovata.")
-        return
-
-    plist_cache[ctx.guild.id] = entries
-    msg = "\n".join(f"{i}. {p.get('title','Sconosciuta')[:80]}" for i, p in enumerate(entries, 1))
-    await ctx.send(
-        f"**Playlist trovate:**\n"
-        f"'''\n{msg}\n'''\n"
-        "Usa '!playlist <numero>' per aggiungerla."
     )
 
 
@@ -295,83 +313,6 @@ async def play(ctx: commands.Context, *, arg: str):
 
     # Avvia riproduzione se fermo
     if not vc.is_playing() and not vc.is_paused():
-        await _play_next(ctx)
-
-
-
-#@bot.command(name="playlist", aliases=["ytpl"], help="Aggiunge playlist n dalla ricerca, URL o ricerca automatica.")
-async def playlist_add(ctx: commands.Context, *, arg: str):
-    # 1) Se è un indice
-    if arg.isdigit():
-        idx = int(arg) - 1
-        entries = plist_cache.get(ctx.guild.id)
-        if entries and 0 <= idx < len(entries):
-            pl_info = entries[idx]
-            try:
-                full = yt_dlp.YoutubeDL(build_ydl_opts()).extract_info(pl_info["url"], download=False)
-            except Exception as e:
-                await ctx.send(f"❌ Errore caricamento playlist: {e}")
-                return
-            videos = full.get("entries", [])
-            for v in videos:
-                add_song(ctx.guild.id, v)
-            await ctx.send(f"📥 Playlist aggiunta: **{full.get('title','Sconosciuta')}** ({len(videos)} tracce).")
-        else:
-            await ctx.send("⚠️ Indice invalido o nessuna ricerca playlist precedente.")
-    # 2) Se è un URL
-    elif arg.startswith("http://") or arg.startswith("https://"):
-        try:
-            info = yt_dlp.YoutubeDL(build_ydl_opts()).extract_info(arg, download=False)
-        except Exception as e:
-            await ctx.send(f"❌ Errore URL: {e}")
-            return
-
-        if info.get("_type") == "playlist" or "entries" in info:
-            videos = info["entries"]
-            for v in videos:
-                add_song(ctx.guild.id, v)
-            await ctx.send(f"📥 Playlist aggiunta: **{info.get('title','Sconosciuta')}** ({len(videos)} tracce).")
-        else:
-            await ctx.send("⚠️ L'URL non è una playlist valida.")
-    # 3) Fallback: cerca playlist e prendi la prima
-    else:
-        async with ctx.typing():
-            ydl_opts = build_ydl_opts({
-                "skip_download": True,
-                "extract_flat": True,
-                "default_search": "ytsearch1",
-                "forcejson": True,
-            })
-            try:
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    result = ydl.extract_info(f"{arg} playlist", download=False)
-                    candidates = [e for e in result.get("entries", []) if e.get("_type") == "playlist"]
-            except Exception as e:
-                await ctx.send(f"❌ Errore ricerca playlist automatica: {e}")
-                return
-
-        if not candidates:
-            await ctx.send("⚠️ Nessuna playlist trovata dalla ricerca automatica.")
-            return
-
-        pl = candidates[0]
-        try:
-            full = yt_dlp.YoutubeDL(build_ydl_opts()).extract_info(pl["url"], download=False)
-        except Exception as e:
-            await ctx.send(f"❌ Errore caricamento playlist trovata: {e}")
-            return
-
-        videos = full.get("entries", [])
-        for v in videos:
-            add_song(ctx.guild.id, v)
-        await ctx.send(
-            f"🔎 Non era indice né URL, ho cercato '**{arg}** playlist' e aggiunto automaticamente: **{full.get('title','Sconosciuta')}** "
-            f"({len(videos)} tracce).\nPer scegliere una playlist specifica usa `!search_playlist` e poi `!playlist <numero>`."
-        )
-
-    # Se non sta già riproducendo, avvia
-    vc = await ensure_voice(ctx)
-    if vc and not vc.is_playing() and not vc.is_paused():
         await _play_next(ctx)
 
 
