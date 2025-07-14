@@ -244,14 +244,14 @@ async def yt_search(ctx: commands.Context, *, query: str):
     await ctx.send(
         f"**Risultati per:** '{query}'\n"
         f"'''\n{elenco}\n'''\n"
-        "Usa '!play <numero>' per aggiungere alla coda."
+        "Usa '?play <numero>' per aggiungere alla coda."
     )
 
 
 # ---------------------------------------------------------------------------#
 #                      COMANDI DI RIPRODUZIONE / CODA                         #
 # ---------------------------------------------------------------------------#
-@bot.command(name="play", aliases=["!"], help="Aggiunge video n dalla ricerca, URL o ricerca automatica.")
+@bot.command(name="play", aliases=["?"], help="Aggiunge video n dalla ricerca, URL o ricerca automatica.")
 async def play(ctx: commands.Context, *, arg: str):
     vc = await ensure_voice(ctx)
     if vc is None:
@@ -308,7 +308,7 @@ async def play(ctx: commands.Context, *, arg: str):
         add_song(ctx.guild.id, video)
         await ctx.send(
             f"🔎 Non era indice né URL, ho cercato '**{arg}**' e aggiunto automaticamente: **{video.get('title','Sconosciuto')}**\n"
-            "Per scegliere un video specifico usa `!search` e poi `!play <numero>`."
+            "Per scegliere un video specifico usa `?search` e poi `?play <numero>`."
         )
 
     # Avvia riproduzione se fermo
@@ -356,7 +356,7 @@ async def clear_queue(ctx: commands.Context):
     await ctx.send("🗑️ Coda cancellata.")
 
 
-@bot.command(name="pause", aliases=["p"], help="Metti in pausa la riproduzione (!resume per riprendere).")
+@bot.command(name="pause", aliases=["p"], help="Metti in pausa la riproduzione (?resume per riprendere).")
 async def pause(ctx: commands.Context):
     if ctx.voice_client and ctx.voice_client.is_playing():
         ctx.voice_client.pause()
